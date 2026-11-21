@@ -198,6 +198,7 @@ fn radio_actions<'a>(
         name,
         save_radio: Some(seed.to_string()),
         plays_shown_rows: false,
+        album_view: None,
     }
 }
 

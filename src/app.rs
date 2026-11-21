@@ -250,6 +250,9 @@ struct PendingAlbumQueue {
     target: Target,
     offset: u32,
     tracks: Vec<Track>,
+    /// The playlist (id and name) the album's songs go into, when they are
+    /// for a playlist rather than the queue.
+    playlist: Option<(String, String)>,
 }
 
 struct PendingQueueAdd {
@@ -576,6 +579,10 @@ pub struct App {
     pub home: HomeData,
     /// Local play history. See [`crate::history`].
     pub plays: crate::history::History,
+    /// When each album was last played. See [`crate::album_shelf`].
+    pub album_plays: crate::album_shelf::AlbumPlays,
+    /// Playlists shown as albums rather than songs, by id.
+    pub album_playlists: HashSet<String>,
     /// Writes settings, session and history off the UI thread.
     files: fastframe_file::Writer,
     /// Current track timing used to decide when a play counts.
@@ -862,6 +869,9 @@ pub struct App {
     /// Queue additions shown before Spotify confirms them, with request time.
     pending_queue_adds: Vec<PendingQueueAdd>,
     pending_album_queues: HashMap<u64, PendingAlbumQueue>,
+    /// The album shuffle playing, if one is: its playlist's URI and its
+    /// play order. Turning Shuffle off puts the playlist's order back.
+    album_shuffle_playing: Option<(String, Vec<String>)>,
     pending_queue_batches: HashMap<u64, Target>,
     album_queue_serial: u64,
     /// The latest `play-search` command. Its answer plays only while this
@@ -1128,6 +1138,9 @@ impl App {
         // settings beside it until migration binds that password in the store.
         settings.proxy_password_legacy |= dirs.proxy_secret_file().try_exists().unwrap_or(true);
         let plays = crate::history::History::load(&dirs.history_file());
+        let mut album_plays = crate::album_shelf::AlbumPlays::load(&dirs.album_plays_file());
+        // Plays made before albums were kept still place their albums.
+        album_plays.absorb(plays.plays());
         let tap = crate::vis::AudioTap::new();
         let eq = crate::eq::shared();
         if let Ok(mut shared) = eq.lock() {
@@ -1345,6 +1358,8 @@ impl App {
             liked_recheck_at: None,
             home: HomeData::default(),
             plays,
+            album_plays,
+            album_playlists: session.album_playlists.iter().cloned().collect(),
             files: fastframe_file::Writer::new(),
             listening: None,
             recents: crate::model::CursorList::default(),
@@ -1503,6 +1518,7 @@ impl App {
             manual_queue: Vec::new(),
             pending_queue_adds: Vec::new(),
             pending_album_queues: HashMap::new(),
+            album_shuffle_playing: None,
             pending_queue_batches: HashMap::new(),
             album_queue_serial: 0,
             play_search_serial: 0,
@@ -6991,8 +7007,7 @@ impl App {
                 }
                 let restart_from_top = self.playlist_pages.get(&id).is_some_and(|page| {
                     page.items.base_offset > 0
-                        && (!page.filter.trim().is_empty()
-                            || self.table_sorts.contains_key(&Page::Playlist(id.clone())))
+                        && (!page.filter.trim().is_empty() || self.wants_whole_playlist(&id))
                 });
                 if restart_from_top {
                     self.load_playlist_items_at(&id, 0);
@@ -7086,13 +7101,14 @@ impl App {
         match page {
             Page::Playlist(id) => {
                 self.report_lagging_snapshot(&id);
+                let whole = self.wants_whole_playlist(&id);
                 let Some(page) = self.playlist_pages.get_mut(&id) else {
                     return;
                 };
                 if page.pending_writes > 0
                     || page.optimistic_snapshot.is_some()
                     || !page.filter.trim().is_empty()
-                    || self.table_sorts.contains_key(&Page::Playlist(id.clone()))
+                    || whole
                 {
                     return;
                 }
@@ -8465,35 +8481,44 @@ impl App {
                 generation,
                 limit,
                 result,
-            } => match who {
-                RecentsFor::Home => {
-                    if generation != self.home.generation {
-                        return;
-                    }
-                    if let Ok(page) = &result {
-                        self.note_recent_contexts(&page.items);
-                    }
-                    let items = result
-                        .as_ref()
-                        .map(|page| page.items.clone())
-                        .map_err(|error| error.to_string());
-                    let changed = items.is_ok();
-                    self.home.refresh_failed |= !changed;
-                    self.home.recently_played.refresh(items);
-                    self.home_answered(changed);
+            } => {
+                // Plays on other devices place their albums, however old
+                // the request that brought them.
+                if let Ok(page) = &result {
+                    self.album_plays.absorb(&page.items);
+                    self.album_plays
+                        .save(&self.files, &self.dirs.album_plays_file());
                 }
-                RecentsFor::Panel => {
-                    if generation != self.recents_generation {
-                        return;
+                match who {
+                    RecentsFor::Home => {
+                        if generation != self.home.generation {
+                            return;
+                        }
+                        if let Ok(page) = &result {
+                            self.note_recent_contexts(&page.items);
+                        }
+                        let items = result
+                            .as_ref()
+                            .map(|page| page.items.clone())
+                            .map_err(|error| error.to_string());
+                        let changed = items.is_ok();
+                        self.home.refresh_failed |= !changed;
+                        self.home.recently_played.refresh(items);
+                        self.home_answered(changed);
                     }
-                    self.recents.loading = false;
-                    self.recents.loaded_once = true;
-                    match result {
-                        Ok(page) => self.absorb_recents(page, limit),
-                        Err(error) => self.recents.error = Some(error.to_string()),
+                    RecentsFor::Panel => {
+                        if generation != self.recents_generation {
+                            return;
+                        }
+                        self.recents.loading = false;
+                        self.recents.loaded_once = true;
+                        match result {
+                            Ok(page) => self.absorb_recents(page, limit),
+                            Err(error) => self.recents.error = Some(error.to_string()),
+                        }
                     }
                 }
-            },
+            }
             ApiResponse::TopTracks {
                 period,
                 offset,
@@ -9009,8 +9034,9 @@ impl App {
                 self.request_user_names(adders);
                 self.sample_playlist_tail(&id);
                 self.checkpoint_playlist_cache(&id);
-                // A sorted table means the whole list, not the loaded part.
-                if self.table_sorts.contains_key(&Page::Playlist(id.clone())) {
+                // A sorted table means the whole list, not the loaded part,
+                // and so does a shelf of albums.
+                if self.wants_whole_playlist(&id) {
                     self.load_more(Page::Playlist(id));
                 }
             }
@@ -9060,12 +9086,35 @@ impl App {
                         if let Some(Dialog::CreatePlaylist { add_uris, .. }) = self.dialog.take()
                             && !add_uris.is_empty()
                         {
-                            self.backend.api(ApiRequest::AddToPlaylist {
-                                playlist_id: playlist.id.clone(),
-                                playlist_name: playlist.name.clone(),
-                                uris: add_uris,
-                                position: None,
-                            });
+                            // Albums cannot be added by link: their songs are.
+                            // A playlist made from an album shows albums.
+                            let (albums, songs): (Vec<String>, Vec<String>) = add_uris
+                                .into_iter()
+                                .partition(|uri| util::uri_kind(uri) == Some("album"));
+                            if !albums.is_empty() {
+                                self.album_playlists.insert(playlist.id.clone());
+                                self.session_dirty = true;
+                            }
+                            for album_uri in albums {
+                                let album_name = util::uri_id(&album_uri)
+                                    .and_then(|id| self.known_album(id))
+                                    .map(|album| album.name.clone())
+                                    .unwrap_or_default();
+                                self.add_album_to_playlist(
+                                    album_uri,
+                                    album_name,
+                                    playlist.id.clone(),
+                                    playlist.name.clone(),
+                                );
+                            }
+                            if !songs.is_empty() {
+                                self.backend.api(ApiRequest::AddToPlaylist {
+                                    playlist_id: playlist.id.clone(),
+                                    playlist_name: playlist.name.clone(),
+                                    uris: songs,
+                                    position: None,
+                                });
+                            }
                         }
                         self.open(Page::Playlist(playlist.id));
                     }
@@ -10422,6 +10471,15 @@ impl App {
     }
 
     /// Merges local and Spotify history for the Recent tab.
+    /// Whether a playlist needs all its rows, not the loaded part: its
+    /// table is sorted, or it is shown as albums.
+    fn wants_whole_playlist(&self, id: &str) -> bool {
+        self.album_playlists.contains(id)
+            || self
+                .table_sorts
+                .contains_key(&Page::Playlist(id.to_string()))
+    }
+
     fn rebuild_recents(&mut self) {
         self.recents_view = crate::history::merged(self.plays.plays(), &self.recents.items).into();
     }
@@ -10642,6 +10700,51 @@ impl App {
             && matches!(self.auth, AuthStatus::Starting | AuthStatus::Connecting))
     }
 
+    /// Plays a playlist shown as albums with its albums shuffled: albums in
+    /// random order, each album's songs back to back, `first_album` first.
+    /// Shuffle is on, as it shows, though the player plays the list
+    /// straight. Returns false, playing nothing, when `uri` is no such
+    /// playlist or none of its rows are loaded; the caller then plays it
+    /// as any other.
+    fn album_shuffle(&mut self, uri: &str, first_album: Option<&str>) -> bool {
+        let Some(id) = uri.strip_prefix("spotify:playlist:") else {
+            return false;
+        };
+        if !self.album_playlists.contains(id) {
+            return false;
+        }
+        let Some(page) = self.playlist_pages.get(id) else {
+            return false;
+        };
+        let shelf = crate::album_shelf::shelf(&page.items.items, &self.album_plays);
+        let order = crate::album_shelf::album_shuffle_order(&shelf, first_album, &mut rand::rng());
+        if order.is_empty() {
+            return false;
+        }
+        if !self.shuffle_wanted {
+            self.shuffle_wanted = true;
+            self.session_dirty = true;
+        }
+        let first = order[0].clone();
+        let request = PlayRequest {
+            uris: order,
+            in_order: true,
+            ..PlayRequest::default()
+        };
+        let order = request.uris.clone();
+        self.play_request(request, false);
+        self.album_shuffle_playing = Some((uri.to_string(), order));
+        self.cache_track_from_context(uri, &first);
+        self.played_row = None;
+        self.note_recent_context(uri);
+        self.assumed_context = Some(AssumedContext {
+            uri: uri.to_string(),
+            shuffle: Some(false),
+            at: Instant::now(),
+        });
+        true
+    }
+
     fn start_play(&mut self, request: PlayRequest, shuffle_first: bool) {
         if self.soloist_waiting() && !self.soloist_recovering() {
             self.clear_play_pending();
@@ -10656,7 +10759,17 @@ impl App {
             self.shuffle_set_at = Some(Instant::now());
             self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
         }
-        let shuffle = shuffle_first || self.shuffle_wanted;
+        // An album shuffle orders its songs itself: the player plays them
+        // straight while Shuffle stays on. The player's report of shuffle
+        // off is then this request's doing, not another app's.
+        let shuffle = !request.in_order && (shuffle_first || self.shuffle_wanted);
+        if !request.in_order {
+            // Anything else started ends the album shuffle.
+            self.album_shuffle_playing = None;
+        }
+        if request.in_order {
+            self.shuffle_set_at = Some(Instant::now());
+        }
         if request.offset_uri.is_none()
             && request.offset_position.is_none()
             && request.uris.is_empty()
@@ -10709,7 +10822,10 @@ impl App {
         } else {
             self.intent_track = None;
         }
-        self.set_play_pending(keys);
+        // A paused load starts nothing, so nothing is pending.
+        if !request.paused {
+            self.set_play_pending(keys);
+        }
         if let Some(context) = request.context_uri.clone() {
             self.note_recent_context(&context);
         }
@@ -10737,11 +10853,15 @@ impl App {
                 load.repeat = Some(self.local_repeat());
                 self.local_list = load.context_uri.is_none().then(|| load.uris.clone());
                 let shuffle_after = shuffle && load.shuffle.is_none() && !load.uris.is_empty();
+                if request.in_order {
+                    // Loaded unshuffled; expect the player to say so.
+                    self.local.shuffle = false;
+                }
                 self.backend.player(PlayerCommand::Load(load));
                 if shuffle_after {
                     self.backend.player(PlayerCommand::Shuffle(true));
                 }
-                self.optimistic_playing = Some((true, Instant::now()));
+                self.optimistic_playing = Some((!request.paused, Instant::now()));
             }
             // Wait for this computer's connecting player. With no remote
             // device the play goes to it, and a device the Web API reports
@@ -10768,15 +10888,33 @@ impl App {
             // playing, which a Sonos is.
             Target::Remote(device_id) => {
                 self.queued_play = None;
+                if request.in_order {
+                    // The device may be shuffling; it must play the list
+                    // as given. Turned off before or after the start, the
+                    // list then plays in its own order.
+                    if let Some(remote) = self.remote.as_mut() {
+                        remote.state.shuffle_state = false;
+                    }
+                    self.backend.api(ApiRequest::Remote {
+                        action: RemoteAction::Shuffle,
+                        device_id: device_id.clone(),
+                        play: None,
+                        position_ms: 0,
+                        percent: 0,
+                        flag: false,
+                        repeat: String::new(),
+                    });
+                }
+                let paused = request.paused;
                 if shuffle {
                     self.backend.api(ApiRequest::ShufflePlay {
-                        device_id,
+                        device_id: device_id.clone(),
                         play: request,
                     });
                 } else {
                     self.backend.api(ApiRequest::Remote {
                         action: RemoteAction::Play,
-                        device_id,
+                        device_id: device_id.clone(),
                         play: Some(request),
                         position_ms: 0,
                         percent: 0,
@@ -10784,7 +10922,19 @@ impl App {
                         repeat: String::new(),
                     });
                 }
-                self.optimistic_playing = Some((true, Instant::now()));
+                if paused {
+                    // The Web API's play always starts; pause right after.
+                    self.backend.api(ApiRequest::Remote {
+                        action: RemoteAction::Pause,
+                        device_id,
+                        play: None,
+                        position_ms: 0,
+                        percent: 0,
+                        flag: false,
+                        repeat: String::new(),
+                    });
+                }
+                self.optimistic_playing = Some((!paused, Instant::now()));
             }
         }
     }
@@ -10989,10 +11139,7 @@ impl App {
         self.request_contains(uris);
         self.request_user_names(adders);
         self.sample_playlist_tail(id);
-        if self
-            .table_sorts
-            .contains_key(&Page::Playlist(id.to_string()))
-        {
+        if self.wants_whole_playlist(id) {
             self.load_more(Page::Playlist(id.to_string()));
         }
     }
@@ -11385,7 +11532,30 @@ impl App {
         }
     }
 
+    /// The album shuffle playing now: its playlist still plays, and the
+    /// playing song is one the shuffle handed over.
+    fn album_shuffle_now(&self) -> bool {
+        let Some((playlist, order)) = &self.album_shuffle_playing else {
+            return false;
+        };
+        self.playing_context_uri().as_deref() == Some(playlist.as_str())
+            && self
+                .current_track_uri()
+                .is_some_and(|song| order.contains(&song))
+    }
+
     fn set_shuffle(&mut self, shuffle: bool) {
+        if self.album_shuffle_now() {
+            if shuffle {
+                // Already shuffling, by album: shuffling its songs as well
+                // would break the albums up.
+                self.shuffle_wanted = true;
+                return;
+            }
+            self.unshuffle_albums();
+            return;
+        }
+        self.album_shuffle_playing = None;
         self.shuffle_wanted = shuffle;
         self.shuffle_set_at = Some(Instant::now());
         self.session_dirty = true;
@@ -11419,6 +11589,29 @@ impl App {
         }
     }
 
+    /// Shuffle off during an album shuffle: the playlist plays on in its
+    /// own order from the playing song, at the same place, paused if it
+    /// was paused, as Shuffle off does for any playlist.
+    fn unshuffle_albums(&mut self) {
+        let Some((playlist, _)) = self.album_shuffle_playing.take() else {
+            return;
+        };
+        self.shuffle_wanted = false;
+        self.shuffle_set_at = Some(Instant::now());
+        self.session_dirty = true;
+        let Some(now) = self.now_playing() else {
+            return;
+        };
+        let request = PlayRequest {
+            context_uri: Some(playlist),
+            offset_uri: Some(now.uri),
+            position_ms: now.position_ms,
+            paused: !now.playing,
+            ..PlayRequest::default()
+        };
+        self.play_request(request, false);
+    }
+
     /// The repeat mode local playback follows: the engine's once it has a
     /// song, until then the one the last run saved.
     fn local_repeat(&self) -> RepeatMode {
@@ -11439,6 +11632,7 @@ impl App {
             | Action::PlayUris { .. }
             | Action::PlayEpisode { .. }
             | Action::PlayFromRow { .. }
+            | Action::PlayAlbumShuffle { .. }
             | Action::ShufflePlay(_) => true,
             Action::PlaySearchMatch { serial, .. } => *serial == self.play_search_serial,
             Action::Previous => {
@@ -11589,6 +11783,7 @@ impl App {
                 target: self.target(),
                 offset: 0,
                 tracks: Vec::new(),
+                playlist: None,
             },
         );
         self.backend.api(ApiRequest::AlbumQueueTracks {
@@ -11613,7 +11808,8 @@ impl App {
             return;
         }
         let mut pending = self.pending_album_queues.remove(&request).unwrap();
-        if pending.target != self.target() {
+        // A playlist does not care where the music plays.
+        if pending.playlist.is_none() && pending.target != self.target() {
             self.toast_error(gettext(
                 self.locale,
                 "Playback device changed. Add the album to queue again",
@@ -11630,9 +11826,18 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.toast_error(
+                let message = match &pending.playlist {
+                    Some((_, playlist_name)) => {
+                        // Translators: {name} is an album name, {playlist} a
+                        // playlist name and {error} an error message.
+                        gettext(self.locale, "Couldn't add {name} to {playlist}: {error}")
+                            .replace("{playlist}", playlist_name)
+                    }
                     // Translators: {name} is an album name and {error} is an error message.
-                    gettext(self.locale, "Couldn't add {name} to queue: {error}")
+                    None => gettext(self.locale, "Couldn't add {name} to queue: {error}").into(),
+                };
+                self.toast_error(
+                    message
                         .replace("{name}", &pending.label)
                         .replace("{error}", &error.to_string()),
                 );
@@ -11663,9 +11868,99 @@ impl App {
                 request,
             });
             self.pending_album_queues.insert(request, pending);
+        } else if let Some((playlist_id, playlist_name)) = pending.playlist {
+            self.add_album_tracks_to_playlist(
+                &pending.id,
+                pending.tracks,
+                playlist_id,
+                playlist_name,
+            );
         } else {
             self.queue_album_tracks(pending.tracks, pending.label);
         }
+    }
+
+    /// Adds every song of an album to a playlist. Songs already loaded on
+    /// the album's page go in at once; otherwise they are asked for first.
+    fn add_album_to_playlist(
+        &mut self,
+        album_uri: String,
+        album_name: String,
+        playlist_id: String,
+        playlist_name: String,
+    ) {
+        let Some(id) = util::uri_id(&album_uri).map(str::to_string) else {
+            return;
+        };
+        if let Some(page) = self.album_pages.get(&id)
+            && page.tracks.is_complete()
+        {
+            let tracks = page.tracks.items.clone();
+            self.add_album_tracks_to_playlist(&id, tracks, playlist_id, playlist_name);
+            return;
+        }
+        self.album_queue_serial = self.album_queue_serial.wrapping_add(1);
+        let request = self.album_queue_serial;
+        // Translators: {name} is an album name and {playlist} a playlist name.
+        let toast = gettext(self.locale, "Adding {name} to {playlist}…")
+            .replace("{name}", &album_name)
+            .replace("{playlist}", &playlist_name);
+        self.pending_album_queues.insert(
+            request,
+            PendingAlbumQueue {
+                id: id.clone(),
+                label: album_name,
+                target: self.target(),
+                offset: 0,
+                tracks: Vec::new(),
+                playlist: Some((playlist_id, playlist_name)),
+            },
+        );
+        self.backend.api(ApiRequest::AlbumQueueTracks {
+            id,
+            offset: 0,
+            request,
+        });
+        self.toast(toast);
+    }
+
+    /// Puts an album's songs into a playlist. Spotify lists an album's songs
+    /// without their album, so each is given it here: the new rows then
+    /// group under their album at once, before Spotify's copy arrives.
+    fn add_album_tracks_to_playlist(
+        &mut self,
+        album_id: &str,
+        tracks: Vec<Track>,
+        playlist_id: String,
+        playlist_name: String,
+    ) {
+        let mut album = self
+            .album_pages
+            .get(album_id)
+            .and_then(|page| page.album.get())
+            .or_else(|| self.known_album(album_id))
+            .cloned()
+            .unwrap_or_else(|| Album {
+                id: album_id.to_string(),
+                uri: format!("spotify:album:{album_id}"),
+                ..Album::default()
+            });
+        album.tracks = None;
+        let items: Vec<PlayableItem> = tracks
+            .into_iter()
+            .filter(|track| {
+                !track.is_local
+                    && track.is_playable != Some(false)
+                    && util::uri_kind(&track.uri) == Some("track")
+            })
+            .map(|mut track| {
+                if track.album.as_ref().is_none_or(|known| known.id.is_empty()) {
+                    track.album = Some(album.clone());
+                }
+                PlayableItem::Track(track)
+            })
+            .collect();
+        self.request_playlist_add(playlist_id, playlist_name, items, None);
     }
 
     fn queue_album_tracks(&mut self, tracks: Vec<Track>, label: String) {
@@ -12549,6 +12844,7 @@ impl App {
                     | Action::PlayEpisode { .. }
                     | Action::PlayUris { .. }
                     | Action::PlayFromRow { .. }
+                    | Action::PlayAlbumShuffle { .. }
                     | Action::ShufflePlay(_)
             );
         if self.soloist_waiting()
@@ -12561,6 +12857,7 @@ impl App {
                     | Action::PlayEpisode { .. }
                     | Action::PlayUris { .. }
                     | Action::PlayFromRow { .. }
+                    | Action::PlayAlbumShuffle { .. }
                     | Action::ShufflePlay(_)
                     | Action::TogglePlay
                     | Action::Next
@@ -12669,11 +12966,17 @@ impl App {
                     self.evict_stale_pages();
                 }
             }
+            // A playlist shown as albums, started from its top with Shuffle
+            // on, shuffles its albums; the guard plays it so when it can.
             Action::PlayContext {
                 uri,
                 offset_uri,
                 offset_index,
-            } => {
+            } if offset_uri.is_some()
+                || offset_index.is_some()
+                || !self.shuffle_wanted
+                || !self.album_shuffle(&uri, None) =>
+            {
                 let mut request = PlayRequest::context(uri);
                 request.offset_uri = offset_uri;
                 request.offset_position = offset_index;
@@ -12794,6 +13097,19 @@ impl App {
                     });
                 }
             },
+            Action::PlayContext { .. } => {}
+            // Shuffle play turns Shuffle on, so it shuffles such a
+            // playlist's albums too.
+            Action::ShufflePlay(uri) if self.album_shuffle(&uri, None) => {}
+            Action::PlayAlbumShuffle {
+                playlist_id,
+                first_album,
+            } => {
+                self.album_shuffle(
+                    &format!("spotify:playlist:{playlist_id}"),
+                    first_album.as_deref(),
+                );
+            }
             Action::ShufflePlay(uri) => {
                 // The random starting song is picked in `play_request`,
                 // which every shuffled play goes through.
@@ -13015,6 +13331,21 @@ impl App {
                 items,
             } => {
                 self.request_playlist_add(playlist_id, playlist_name, items, None);
+            }
+            Action::AddAlbumToPlaylist {
+                album_uri,
+                album_name,
+                playlist_id,
+                playlist_name,
+            } => {
+                self.add_album_to_playlist(album_uri, album_name, playlist_id, playlist_name);
+            }
+            Action::ToggleAlbumView(playlist_id) => {
+                if !self.album_playlists.remove(&playlist_id) {
+                    self.album_playlists.insert(playlist_id.clone());
+                    self.load_more(Page::Playlist(playlist_id));
+                }
+                self.session_dirty = true;
             }
             Action::InsertInPlaylist {
                 playlist_id,
@@ -13893,6 +14224,9 @@ impl App {
                 self.storage_usage.invalidate();
                 self.plays.clear();
                 self.plays.save(&self.files, &self.dirs.history_file());
+                self.album_plays.clear();
+                self.album_plays
+                    .save(&self.files, &self.dirs.album_plays_file());
                 self.rebuild_recents();
                 self.toast(gettext(self.locale, "Play history cleared"));
             }
@@ -14714,6 +15048,8 @@ impl App {
                 Event::Suspending(ack) | Event::EndingSession(ack) => {
                     self.save_state();
                     self.plays.save(&self.files, &self.dirs.history_file());
+                    self.album_plays
+                        .save(&self.files, &self.dirs.album_plays_file());
                     // The system may stop for good after this: the writes
                     // reach the disk before it is told to go ahead, within
                     // the time the system is held for.
@@ -14819,8 +15155,13 @@ impl App {
             return;
         }
         listening.recorded = true;
-        self.plays
-            .record(crate::history::played_track(&now), jiff::Timestamp::now());
+        let at = jiff::Timestamp::now();
+        if let Some(album_id) = &now.album_id {
+            self.album_plays.note(album_id, at.as_second());
+            self.album_plays
+                .save(&self.files, &self.dirs.album_plays_file());
+        }
+        self.plays.record(crate::history::played_track(&now), at);
         self.plays.save(&self.files, &self.dirs.history_file());
         self.rebuild_recents();
     }
@@ -15116,6 +15457,11 @@ impl App {
                     .iter()
                     .map(|(page, sort)| (page.encode(), *sort))
                     .collect(),
+                album_playlists: {
+                    let mut ids: Vec<String> = self.album_playlists.iter().cloned().collect();
+                    ids.sort();
+                    ids
+                },
                 window_size: self.window_geometry.size,
                 window_pos: self.window_geometry.position,
                 window_maximized: self.window_geometry.maximized,
@@ -15547,7 +15893,7 @@ fn local_load(request: &PlayRequest, shuffle: bool) -> LoadSpec {
         return LoadSpec {
             context_uri: Some(request.uris[0].clone()),
             position_ms: request.position_ms,
-            play: true,
+            play: !request.paused,
             ..LoadSpec::default()
         };
     }
@@ -15564,7 +15910,7 @@ fn local_load(request: &PlayRequest, shuffle: bool) -> LoadSpec {
         offset_uri: request.offset_uri.clone(),
         offset_index: request.offset_position,
         position_ms: request.position_ms,
-        play: true,
+        play: !request.paused,
         shuffle: (shuffle && !(list && chosen)).then_some(true),
         repeat: None,
         autoplay: false,
@@ -30111,6 +30457,363 @@ mod tests {
         ));
     }
 
+    /// Adding an album to a playlist adds all its songs, fetched page by
+    /// page, and each new row names the album at once, though Spotify
+    /// lists an album's songs without it: the playlist shown as albums
+    /// shows the album before Spotify's own copy arrives.
+    #[test]
+    fn an_album_added_to_a_playlist_brings_every_song_under_its_album() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.playlist_pages.insert(
+            "target".into(),
+            PlaylistPage {
+                playlist: Loadable::Loaded(Playlist {
+                    id: "target".into(),
+                    name: "Target".into(),
+                    collaborative: true,
+                    ..Default::default()
+                }),
+                items: PagedList {
+                    items: Vec::new(),
+                    total: Some(0),
+                    next_offset: None,
+                    loaded_once: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        app.album_playlists.insert("target".into());
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::AddAlbumToPlaylist {
+                album_uri: "spotify:album:alb".into(),
+                album_name: "The Album".into(),
+                playlist_id: "target".into(),
+                playlist_name: "Target".into(),
+            },
+            &ctx,
+        );
+        let request = app.album_queue_serial;
+        assert!(matches!(
+            app.backend.take_queue_requests().as_slice(),
+            [ApiRequest::AlbumQueueTracks { offset: 0, .. }]
+        ));
+        let page = |items: Vec<Track>, offset, next: Option<&str>| crate::api::models::Page {
+            items,
+            offset,
+            limit: 2,
+            total: 3,
+            next: next.map(str::to_string),
+        };
+        app.handle_api(ApiResponse::AlbumQueueTracks {
+            request,
+            offset: 0,
+            result: Ok(page(
+                vec![album_queue_track("one"), album_queue_track("two")],
+                0,
+                Some("next"),
+            )),
+        });
+        app.handle_api(ApiResponse::AlbumQueueTracks {
+            request,
+            offset: 2,
+            result: Ok(page(vec![album_queue_track("three")], 2, None)),
+        });
+        assert!(matches!(
+            app.backend.take_playlist_add_requests().as_slice(),
+            [ApiRequest::AddToPlaylist { uris, .. }]
+                if uris == &["spotify:track:one", "spotify:track:two", "spotify:track:three"]
+        ));
+        let shelf =
+            crate::album_shelf::shelf(&app.playlist_pages["target"].items.items, &app.album_plays);
+        assert_eq!(shelf.len(), 1, "one album, not three songs");
+        assert_eq!(shelf[0].album.uri, "spotify:album:alb");
+        assert_eq!(shelf[0].uris.len(), 3);
+        assert!(app.pending_album_queues.is_empty());
+    }
+
+    /// Whether `order` plays each of the playlist's albums whole, its songs
+    /// back to back in playlist order.
+    fn plays_whole_albums(app: &App, playlist: &str, order: &[String]) -> bool {
+        let shelf =
+            crate::album_shelf::shelf(&app.playlist_pages[playlist].items.items, &app.album_plays);
+        let mut rest = order;
+        while !rest.is_empty() {
+            let Some(album) = shelf
+                .iter()
+                .find(|entry| entry.playable.first() == rest.first())
+            else {
+                return false;
+            };
+            let Some(after) = rest.strip_prefix(album.playable.as_slice()) else {
+                return false;
+            };
+            rest = after;
+        }
+        true
+    }
+
+    /// With Shuffle on, Play on a playlist shown as albums plays its albums
+    /// in random order and each album's songs back to back. The player
+    /// plays the list straight, yet Shuffle stays on, and the playlist is
+    /// what plays, even after the player reports shuffle off.
+    #[test]
+    fn shuffle_on_a_playlist_of_albums_plays_whole_albums_on_this_computer() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        crate::demo::populate(&mut app);
+        app.remote = None;
+        app.selected_device = None;
+        app.local_ready = true;
+        app.local = LocalState {
+            connected: true,
+            shuffle: true,
+            ..Default::default()
+        };
+        app.album_playlists.insert("pl0".into());
+        app.shuffle_wanted = true;
+        app.backend.take_player_commands();
+
+        app.apply(
+            Action::PlayContext {
+                uri: "spotify:playlist:pl0".into(),
+                offset_uri: None,
+                offset_index: None,
+            },
+            &ctx,
+        );
+
+        let commands = app.backend.take_player_commands();
+        let loads: Vec<_> = commands
+            .iter()
+            .filter_map(|command| match command {
+                PlayerCommand::Load(spec) => Some(spec),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].shuffle, None, "the player keeps the order");
+        assert!(loads[0].context_uri.is_none());
+        assert!(loads[0].uris.len() > 1);
+        assert!(plays_whole_albums(&app, "pl0", &loads[0].uris));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, PlayerCommand::Shuffle(true))),
+            "the songs are not shuffled after the load"
+        );
+        assert!(app.playing_context_shuffle(), "Shuffle stays on");
+        assert_eq!(
+            app.playing_context_uri().as_deref(),
+            Some("spotify:playlist:pl0")
+        );
+
+        // The player says it plays unshuffled: that is the album shuffle.
+        let mut reported = app.local.clone();
+        reported.shuffle = false;
+        reported.playback = Playback::Playing;
+        app.handle_local(reported);
+        assert!(app.playing_context_shuffle(), "Shuffle still shows on");
+    }
+
+    /// Shuffle off during an album shuffle puts the playlist's own order
+    /// back: the playlist plays on from the playing song, at its place,
+    /// and paused if it was paused. Shuffle on again while it plays changes
+    /// nothing: the albums are already shuffled.
+    #[test]
+    fn shuffle_off_puts_a_playlist_of_albums_back_in_its_order() {
+        let ctx = egui::Context::default();
+        for playing in [true, false] {
+            let mut app = headless_app();
+            crate::demo::populate(&mut app);
+            app.remote = None;
+            app.selected_device = None;
+            app.local_ready = true;
+            app.local = LocalState {
+                connected: true,
+                ..Default::default()
+            };
+            app.album_playlists.insert("pl0".into());
+            app.shuffle_wanted = true;
+            app.apply(
+                Action::PlayContext {
+                    uri: "spotify:playlist:pl0".into(),
+                    offset_uri: None,
+                    offset_index: None,
+                },
+                &ctx,
+            );
+            let order = app.album_shuffle_playing.clone().unwrap().1;
+            let song = order[1].clone();
+            let mut state = app.local.clone();
+            state.track = Some(crate::player::LocalTrack {
+                uri: song.clone(),
+                duration_ms: 240_000,
+                ..Default::default()
+            });
+            state.track_sequence += 1;
+            state.position_ms = 61_000;
+            state.playback = if playing {
+                Playback::Playing
+            } else {
+                Playback::Paused
+            };
+            app.handle_local(state);
+            app.backend.take_player_commands();
+
+            app.apply(Action::SetShuffle(true), &ctx);
+            assert!(
+                app.backend.take_player_commands().is_empty(),
+                "Shuffle on again leaves the albums be"
+            );
+
+            app.apply(Action::ToggleShuffle, &ctx);
+            assert!(!app.playing_context_shuffle());
+            let loads: Vec<_> = app
+                .backend
+                .take_player_commands()
+                .into_iter()
+                .filter_map(|command| match command {
+                    PlayerCommand::Load(spec) => Some(spec),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(loads.len(), 1, "the playlist loads again");
+            assert_eq!(
+                loads[0].context_uri.as_deref(),
+                Some("spotify:playlist:pl0")
+            );
+            assert_eq!(loads[0].offset_uri.as_deref(), Some(song.as_str()));
+            assert_eq!(loads[0].shuffle, None, "in its own order");
+            assert!(loads[0].position_ms >= 61_000, "at the same place");
+            assert_eq!(loads[0].play, playing, "paused stays paused");
+            assert!(app.album_shuffle_playing.is_none());
+        }
+    }
+
+    /// On another device, the album shuffle turns the device's shuffle off
+    /// and starts the list there, rather than shuffling its songs.
+    #[test]
+    fn shuffle_on_a_playlist_of_albums_plays_whole_albums_on_another_device() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        crate::demo::populate(&mut app);
+        app.local_ready = false;
+        app.local.connected = false;
+        assert!(matches!(app.target(), Target::Remote(_)));
+        app.album_playlists.insert("pl0".into());
+        app.shuffle_wanted = true;
+
+        app.apply(Action::ShufflePlay("spotify:playlist:pl0".into()), &ctx);
+
+        let plays = app.backend.take_remote_play_requests();
+        let [
+            ApiRequest::Remote {
+                action: RemoteAction::Play,
+                play: Some(play),
+                ..
+            },
+        ] = plays.as_slice()
+        else {
+            panic!("one ordered play, not a shuffled one: {plays:?}");
+        };
+        assert!(play.in_order);
+        assert!(plays_whole_albums(&app, "pl0", &play.uris));
+        assert!(matches!(
+            app.backend.take_remote_shuffle_requests().as_slice(),
+            [ApiRequest::Remote { flag: false, .. }]
+        ));
+        assert!(app.playing_context_shuffle());
+    }
+
+    /// With Shuffle off, or for a playlist shown as songs, Play is as ever.
+    #[test]
+    fn a_playlist_of_albums_without_shuffle_plays_as_ever() {
+        let ctx = egui::Context::default();
+        for (albums, shuffle) in [(true, false), (false, true)] {
+            let mut app = headless_app();
+            crate::demo::populate(&mut app);
+            app.local_ready = false;
+            app.local.connected = false;
+            if albums {
+                app.album_playlists.insert("pl0".into());
+            }
+            app.shuffle_wanted = shuffle;
+            app.apply(
+                Action::PlayContext {
+                    uri: "spotify:playlist:pl0".into(),
+                    offset_uri: None,
+                    offset_index: None,
+                },
+                &ctx,
+            );
+            let plays = app.backend.take_remote_play_requests();
+            let play = match plays.as_slice() {
+                [
+                    ApiRequest::Remote {
+                        play: Some(play), ..
+                    },
+                ]
+                | [ApiRequest::ShufflePlay { play, .. }] => play,
+                _ => panic!("one play: {plays:?}"),
+            };
+            assert_eq!(play.context_uri.as_deref(), Some("spotify:playlist:pl0"));
+            assert!(!play.in_order);
+        }
+    }
+
+    /// A playlist shown as albums stays so across restarts, and showing it
+    /// as songs again forgets it.
+    #[test]
+    fn showing_a_playlist_as_albums_is_remembered() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.apply(Action::ToggleAlbumView("shelf".into()), &ctx);
+        assert!(app.album_playlists.contains("shelf"));
+        assert!(app.session_dirty);
+        app.apply(Action::ToggleAlbumView("shelf".into()), &ctx);
+        assert!(!app.album_playlists.contains("shelf"));
+    }
+
+    /// Plays Spotify reports from other devices place their albums on the
+    /// shelf, newest first.
+    #[test]
+    fn plays_from_other_devices_place_their_albums() {
+        let mut app = headless_app();
+        let play = |album: &str, at: &str| crate::api::models::PlayHistory {
+            track: Track {
+                uri: format!("spotify:track:{album}"),
+                album: Some(Album {
+                    id: album.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            played_at: Some(at.into()),
+            context: None,
+        };
+        app.handle_api(ApiResponse::RecentlyPlayed {
+            who: RecentsFor::Panel,
+            generation: app.recents_generation,
+            limit: 50,
+            result: Ok(crate::api::models::CursorPage {
+                items: vec![
+                    play("newer", "2026-11-02T00:00:00Z"),
+                    play("older", "2026-11-01T00:00:00Z"),
+                ],
+                total: None,
+                next: None,
+                cursors: None,
+            }),
+        });
+        assert!(
+            app.album_plays.last_played("newer") > app.album_plays.last_played("older"),
+            "both albums are placed, the newer first"
+        );
+    }
+
     /// Copying picked songs puts their links on the clipboard, one per
     /// line. Pasting links into an editable playlist appends the songs:
     /// ones this app has shown get their rows at once, and the rest wait
@@ -32654,6 +33357,7 @@ mod tests {
                         name: "Test",
                         save_radio: None,
                         plays_shown_rows: false,
+                        album_view: None,
                     },
                     None,
                 );

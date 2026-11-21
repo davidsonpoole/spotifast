@@ -775,6 +775,43 @@ pub fn picked_menu(
 }
 
 fn add_to_playlist_menu(ui: &mut Ui, app: &mut App, items: &[PlayableItem]) {
+    add_to_playlist_submenu(ui, app, PickerAdds::Songs(items));
+}
+
+/// What a playlist picker adds: songs, or every song of an album.
+#[derive(Clone, Copy)]
+pub(crate) enum PickerAdds<'a> {
+    Songs(&'a [PlayableItem]),
+    Album { uri: &'a str, name: &'a str },
+}
+
+impl PickerAdds<'_> {
+    /// The links a new playlist starts with.
+    fn uris(self) -> Vec<String> {
+        match self {
+            Self::Songs(items) => items.iter().map(|item| item.uri().to_string()).collect(),
+            Self::Album { uri, .. } => vec![uri.to_string()],
+        }
+    }
+
+    fn action(self, playlist_id: &str, playlist_name: &str) -> Action {
+        match self {
+            Self::Songs(items) => Action::AddToPlaylist {
+                playlist_id: playlist_id.to_string(),
+                playlist_name: playlist_name.to_string(),
+                items: items.to_vec(),
+            },
+            Self::Album { uri, name } => Action::AddAlbumToPlaylist {
+                album_uri: uri.to_string(),
+                album_name: name.to_string(),
+                playlist_id: playlist_id.to_string(),
+                playlist_name: playlist_name.to_string(),
+            },
+        }
+    }
+}
+
+fn add_to_playlist_submenu(ui: &mut Ui, app: &mut App, adds: PickerAdds<'_>) {
     let query_id = ui.make_persistent_id("add-to-playlist-query");
     let palette = app.palette;
     let opened = menu_submenu_with_field(
@@ -789,7 +826,7 @@ fn add_to_playlist_menu(ui: &mut Ui, app: &mut App, items: &[PlayableItem]) {
                 .filter(|(last_frame, _)| frame.saturating_sub(*last_frame) <= 1);
             let fresh = previous.is_none();
             let mut query = previous.map(|(_, query)| query).unwrap_or_default();
-            let field = playlist_picker(ui, app, items, &mut query, None);
+            let field = playlist_picker_adding(ui, app, adds, &mut query, None);
             if fresh {
                 field.request_focus();
             }
@@ -900,6 +937,16 @@ pub(crate) fn playlist_picker(
     app: &mut App,
     items: &[PlayableItem],
     query: &mut String,
+    checks: Option<&mut PlaylistChecks>,
+) -> egui::Response {
+    playlist_picker_adding(ui, app, PickerAdds::Songs(items), query, checks)
+}
+
+fn playlist_picker_adding(
+    ui: &mut Ui,
+    app: &mut App,
+    adds: PickerAdds<'_>,
+    query: &mut String,
     mut checks: Option<&mut PlaylistChecks>,
 ) -> egui::Response {
     let palette = app.palette;
@@ -975,7 +1022,7 @@ pub(crate) fn playlist_picker(
         app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
             name: String::new(),
             public: false,
-            add_uris: items.iter().map(|item| item.uri().to_string()).collect(),
+            add_uris: adds.uris(),
         }));
     }
     menu_separator(ui, &palette);
@@ -990,11 +1037,7 @@ pub(crate) fn playlist_picker(
         if let Some(checks) = checks.as_deref_mut() {
             checks.toggle(id);
         } else {
-            app.actions.push(Action::AddToPlaylist {
-                playlist_id: id.clone(),
-                playlist_name: name.clone(),
-                items: items.to_vec(),
-            });
+            app.actions.push(adds.action(id, name));
             ui.close();
         }
     }
@@ -1072,11 +1115,7 @@ pub(crate) fn playlist_picker(
                         if let Some(checks) = checks.as_deref_mut() {
                             checks.toggle(id);
                         } else {
-                            app.actions.push(Action::AddToPlaylist {
-                                playlist_id: id.clone(),
-                                playlist_name: name.clone(),
-                                items: items.to_vec(),
-                            });
+                            app.actions.push(adds.action(id, name));
                         }
                     }
                 });
@@ -1514,6 +1553,9 @@ pub fn context_menu_items(
     };
     if owned_playlist.is_none() && menu_item(ui, &palette, Some(icon), &text) {
         app.actions.push(Action::ToggleSaved(uri.to_string()));
+    }
+    if kind == "album" {
+        add_to_playlist_submenu(ui, app, PickerAdds::Album { uri, name });
     }
     if let Some(playlist) = owned_playlist {
         if menu_item(

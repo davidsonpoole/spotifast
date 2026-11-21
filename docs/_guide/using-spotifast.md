@@ -219,6 +219,41 @@ podcast again instead of reusing the episodes loaded earlier, so new
 episodes appear without restarting Spotifast. The episodes already shown
 stay until the new list arrives.
 
+## Playlists of albums {#albums}
+
+Spotify keeps songs in playlists, not albums, so adding an album to a
+playlist adds all of its songs. Right-click an album, or open its **…**
+menu, and choose **Add to playlist**; **New playlist** there makes a playlist
+that starts with the album.
+
+To see such a playlist as albums, choose **Show as albums** (the grid
+button next to a playlist's **…** menu). The playlist then shows one cover
+for each album its songs come from, the album you played most recently
+first, then albums you have not played yet, newest addition first. Each
+cover says when you last played that album. Click a cover to open the
+album, or its play button to play it. In a playlist you can edit,
+right-clicking a cover offers **Remove from this playlist**, which removes
+that album's songs. **Show as songs** brings the song list back. Spotifast
+remembers which playlists show albums, and a playlist made from an album
+shows albums from the start.
+
+With **Shuffle** on, playing a playlist shown as albums shuffles whole
+albums: the albums come in random order, and each album plays from its first
+song to its last, as the playlist holds them. A cover's play button starts
+with that album, then plays the others at random. Each album plays once
+before any comes round again, and each Play picks a new order. Turning
+Shuffle off while it plays carries on from the same song in the playlist's
+own order. With Shuffle off, **Play**
+plays the playlist in its own order and a cover's play button plays just
+that album. This works once the playlist has been opened since Spotifast
+started; until then its songs shuffle as in any playlist.
+
+When an album was last played comes from plays on this computer and the
+plays Spotify reports from your other devices. Spotify's report only reaches
+back about fifty songs, so an album played elsewhere while Spotifast was
+closed for a long time may sort as not played. **Clear history** in
+Settings forgets these times as well.
+
 ## Playing from the sidebar
 
 Double-click a playlist, Liked Songs, album, artist, or podcast row in the

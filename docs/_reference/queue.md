@@ -30,6 +30,21 @@ While another collection plays, toggling Shuffle changes that playback's mode
 without switching to the page's collection. The queue then reflects the new
 play order.
 
+A playlist shown as albums shuffles whole albums. With Shuffle on, its
+**Play** button, **Shuffle play** in its menu, and **Play** in the sidebar
+play its albums in random order, each album's songs back to back in the
+playlist's order. A cover's play button plays that album first, then the
+others at random. Shuffle stays on while the player plays this list
+straight; on another device, Spotifast turns that device's shuffle off for
+it. Each Play shuffles the albums afresh, and plays every album in the list
+once; Repeat plays the same order again. The list holds whole albums up to
+500 songs. Turning Shuffle off puts the playlist's own order back: the
+playlist plays on from the playing song at the same place, paused if it was
+paused. Turning Shuffle on again while the albums play changes nothing. It
+needs the playlist's songs
+loaded this session; before that, the playlist shuffles its songs as any
+other does.
+
 Since 0.8.0, starting a playlist in its original order explicitly
 names its first available song from the loaded prefix. If that prefix is not
 loaded, it requests playlist position zero. A page loaded from the middle

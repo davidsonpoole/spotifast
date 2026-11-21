@@ -53,7 +53,7 @@ struct Cli {
     /// `devices`, `sonos-idle`, `sonos-active`, `cast-idle`, `cast-connecting`, `phone-playing`,
     /// `shortcuts`, `create`, `light`, `system-light`, `system-dark`, `focus`, `update`, `personal-app`,
     /// `windows-taskbar`, `start-in-tray`, `german`, `lyrics`, `lyrics-fullscreen`, `collection-loading`,
-    /// `shuffle-selected`, `shuffle-started`, `undated-mix`, `signed-out`, `connecting`, `library-list`,
+    /// `shuffle-selected`, `shuffle-started`, `undated-mix`, `albums`, `signed-out`, `connecting`, `library-list`,
     /// `library-list-narrow`, `library-list-wide`, `library-grid`, `library-grid-narrow`,
     /// `library-grid-wide`, `waiting-for-browser`, `sign-in-returning`, `sign-in-malformed`,
     /// `sign-in-shared-retired`, `sign-in-unknown-client`, `sign-in-not-allowed`,

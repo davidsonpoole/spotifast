@@ -1713,6 +1713,27 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     }
                 }
             }
+            // The first playlist shown as albums, some of them played.
+            "albums" => {
+                app.album_playlists.insert("pl0".into());
+                let albums: Vec<String> = app
+                    .playlist_pages
+                    .get("pl0")
+                    .into_iter()
+                    .flat_map(|page| page.items.items.iter())
+                    .filter_map(|row| match row.playable() {
+                        Some(crate::api::models::PlayableItem::Track(track)) => {
+                            Some(track.album.as_ref()?.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let now = Timestamp::now().as_second();
+                for (index, album) in albums.iter().rev().step_by(3).enumerate() {
+                    app.album_plays
+                        .note(album, now - 3_600 * (index as i64 * 7 + 1));
+                }
+            }
             "light" => {
                 app.settings.theme = crate::settings::ThemeChoice::Light;
                 app.actions.push(Action::SettingsChanged);

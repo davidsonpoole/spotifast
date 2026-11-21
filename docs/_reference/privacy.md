@@ -21,8 +21,8 @@ current release.
   the data folder, for when Credential Manager loses it. Your Spotify
   password never passes through Spotifast; you sign in on Spotify's own
   pages. A proxy password, if you set one, uses the same store.
-- **Settings and history.** Settings, window positions, recent plays, the
-  last session, skins, themes and MilkDrop presets live in the config
+- **Settings and history.** Settings, window positions, recent plays, when
+  each album was last played, the last session, skins, themes and MilkDrop presets live in the config
   directory. A copy started from the Windows ZIP keeps them, its state and
   its caches in `spotifast-data` next to it, so anyone who can read that
   folder, on a shared USB drive say, can read them.

@@ -319,6 +319,9 @@ pub struct Actions<'a> {
     /// Play the songs on screen even with Shuffle on: some of the context's
     /// songs are hidden (#779).
     pub plays_shown_rows: bool,
+    /// A playlist offers to show its songs as albums: its id, and whether
+    /// it shows albums now.
+    pub album_view: Option<(String, bool)>,
 }
 
 /// The big play button and its neighbours; returns the filter text if a
@@ -504,6 +507,19 @@ pub fn actions_row(
                         refresh_menu_item(app, ui, page, *loading);
                     }
                 });
+        }
+        if let Some((playlist_id, albums)) = &actions.album_view {
+            let (icon, tooltip) = if *albums {
+                (Icon::LayoutList, gettext(locale, "Show as songs"))
+            } else {
+                (Icon::LayoutGrid, gettext(locale, "Show as albums"))
+            };
+            if theme::icon_button(ui, icon, 26.0, palette.secondary, palette.text, &tooltip)
+                .clicked()
+            {
+                app.actions
+                    .push(Action::ToggleAlbumView(playlist_id.clone()));
+            }
         }
         if let Some(filter) = filter {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1926,11 +1942,16 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     .collect();
                 byline.push((contributors_text(app.locale, &named, others.len()), None));
             }
-            let count_text = if page.items.is_complete() {
-                songs_and_duration(app.locale, count, duration_ms)
-            } else {
-                song_count(app.locale, count)
-            };
+            let album_view = app.album_playlists.contains(id);
+            let shelf = album_view.then(|| album_shelf_of(ui, app, id, &page));
+            let count_text =
+                if let Some(shelf) = shelf.as_ref().filter(|_| page.items.is_complete()) {
+                    album_count(app.locale, shelf.len() as u32)
+                } else if page.items.is_complete() {
+                    songs_and_duration(app.locale, count, duration_ms)
+                } else {
+                    song_count(app.locale, count)
+                };
             byline.push((count_text, None));
             let images = hero_images(
                 &playlist.images,
@@ -1973,6 +1994,13 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             let mut actions =
                 playlist_actions(app.locale, playlist, owned, saved, view_play, reload_action);
             actions.plays_shown_rows = hides;
+            actions.album_view = Some((id.to_string(), album_view));
+            if album_view {
+                // The filter picks albums, not songs, so Play plays the
+                // playlist: in its order, or with Shuffle on, its albums
+                // shuffled.
+                actions.view = None;
+            }
             if !app.network_reachable {
                 disabled_actions_row(app, ui, actions, Some(&mut page.filter));
             } else {
@@ -1985,6 +2013,12 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             let editable = app
                 .can_edit_playlist(playlist)
                 .then(|| (playlist.id.clone(), playlist.snapshot_id.clone()));
+            if let Some(shelf) = shelf {
+                let editable = editable.map(|(id, _)| id);
+                album_shelf(app, ui, id, &shelf, &needle, editable.as_deref(), &page);
+                app.playlist_pages.insert(id.to_string(), page);
+                return;
+            }
             table(
                 app,
                 ui,
@@ -2380,6 +2414,7 @@ fn playlist_actions<'a>(
         name: &playlist.name,
         save_radio: None,
         plays_shown_rows: false,
+        album_view: None,
     }
 }
 
@@ -2403,6 +2438,7 @@ fn album_actions<'a>(
         name: &album.name,
         save_radio: None,
         plays_shown_rows: false,
+        album_view: None,
     }
 }
 
@@ -2595,6 +2631,7 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
         name: &liked_title,
         save_radio: None,
         plays_shown_rows: false,
+        album_view: None,
     };
     if !app.network_reachable {
         disabled_actions_row(app, ui, actions, Some(&mut filter));
@@ -2643,6 +2680,182 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// `1,234 songs` in a playlist, album or Liked Songs byline.
+fn album_count(locale: Locale, count: u32) -> String {
+    ngettext(
+        locale,
+        // Translators: {count} is a number of albums in a playlist shown as albums.
+        "{count} album",
+        "{count} albums",
+        count,
+    )
+    .replace("{count}", &util::format_count(u64::from(count)))
+}
+
+/// A playlist's albums, grouped and sorted again only when its rows or
+/// the album plays change.
+fn album_shelf_of(
+    ui: &egui::Ui,
+    app: &App,
+    id: &str,
+    page: &crate::model::PlaylistPage,
+) -> Arc<Vec<crate::album_shelf::ShelfAlbum>> {
+    type Cached = (
+        u64,
+        u64,
+        u64,
+        usize,
+        Arc<Vec<crate::album_shelf::ShelfAlbum>>,
+    );
+    let key = egui::Id::new(("album-shelf", id));
+    let stamp = (
+        page.items.revision,
+        page.items_generation,
+        app.album_plays.revision(),
+        page.items.items.len(),
+    );
+    if let Some((revision, generation, plays, len, shelf)) =
+        ui.data(|data| data.get_temp::<Cached>(key))
+        && (revision, generation, plays, len) == stamp
+    {
+        return shelf;
+    }
+    let shelf = Arc::new(crate::album_shelf::shelf(
+        &page.items.items,
+        &app.album_plays,
+    ));
+    ui.data_mut(|data| {
+        data.insert_temp::<Cached>(
+            key,
+            (stamp.0, stamp.1, stamp.2, stamp.3, Arc::clone(&shelf)),
+        )
+    });
+    shelf
+}
+
+/// A playlist shown as albums: a grid of covers, the album played most
+/// recently first. A cover opens its album; its play button plays it.
+fn album_shelf(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    id: &str,
+    shelf: &[crate::album_shelf::ShelfAlbum],
+    needle: &str,
+    editable_playlist: Option<&str>,
+    page: &crate::model::PlaylistPage,
+) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let shown: Vec<&crate::album_shelf::ShelfAlbum> = shelf
+        .iter()
+        .filter(|entry| crate::album_shelf::matches(entry, needle))
+        .collect();
+    let now = jiff::Timestamp::now();
+    // An album is playing when it plays on its own, or when its song plays
+    // from this playlist, as an album shuffle plays it.
+    let playing_context = app.playing_context_uri();
+    let shuffled_album = (playing_context.as_deref()
+        == Some(format!("spotify:playlist:{id}").as_str()))
+    .then(|| app.now_playing().and_then(|now| now.album_id))
+    .flatten();
+    let card_height = widgets::card_row_height(ui);
+    widgets::virtual_wrapped_cards(ui, shown.len(), card_height, |ui, index| {
+        let entry = shown[index];
+        let album = &entry.album;
+        let artists =
+            crate::api::models::join_names(album.artists.iter().map(|artist| artist.name.as_str()));
+        let subtitle = match entry
+            .last_played
+            .and_then(|at| jiff::Timestamp::from_second(at).ok())
+        {
+            Some(at) => {
+                let when = util::format_relative_date(locale, &at.to_string(), now);
+                // Translators: {when} is when an album was last played, such
+                // as "2 days ago".
+                let played = gettext(locale, "Played {when}").replace("{when}", &when);
+                if artists.is_empty() {
+                    played
+                } else {
+                    format!("{artists} · {played}")
+                }
+            }
+            None => artists,
+        };
+        let context_here = playing_context.as_deref() == Some(album.uri.as_str())
+            || shuffled_album.as_deref() == Some(album.id.as_str());
+        let playing_here = context_here && app.believed_playing();
+        let card_art = app.art_px(widgets::CARD_ART);
+        let card = widgets::card(
+            ui,
+            app,
+            pick_image(&album.images, card_art),
+            &album.name,
+            &subtitle,
+            widgets::CardCover::square(playing_here),
+        );
+        if card.play {
+            if context_here {
+                app.actions.push(Action::TogglePlay);
+            } else if app.playing_context_shuffle() {
+                // With Shuffle on, this album plays first, then the
+                // playlist's other albums at random.
+                app.actions.push(Action::PlayAlbumShuffle {
+                    playlist_id: id.to_string(),
+                    first_album: Some(album.id.clone()),
+                });
+            } else {
+                app.actions.push(Action::PlayContext {
+                    uri: album.uri.clone(),
+                    offset_uri: None,
+                    offset_index: None,
+                });
+            }
+        }
+        if card.clicked {
+            app.actions
+                .push(Action::Open(Page::Album(album.id.clone())));
+        }
+        egui::Popup::context_menu(&card.response)
+            .id(ui.make_persistent_id(("playlist-album-menu", &album.uri)))
+            .frame(widgets::menu_frame(&palette))
+            .show(|ui| {
+                widgets::context_menu_items(ui, app, &album.uri, &album.name, None);
+                if let Some(playlist_id) = editable_playlist {
+                    widgets::menu_separator(ui, &palette);
+                    if widgets::menu_item(
+                        ui,
+                        &palette,
+                        Some(Icon::Minus),
+                        &gettext(locale, "Remove from this playlist"),
+                    ) {
+                        app.actions.push(Action::RemoveFromPlaylist {
+                            playlist_id: playlist_id.to_string(),
+                            uris: entry.uris.clone(),
+                            positions: Vec::new(),
+                        });
+                    }
+                }
+            });
+    });
+    if page.items.loading || page.items.can_load_more() {
+        widgets::loading_row(ui, &palette, locale);
+    } else if let Some(error) = page.items.error.as_deref() {
+        widgets::error_row(ui, app, error, Some(Page::Playlist(id.to_string())));
+    } else if shown.is_empty() {
+        let (title, body) = if needle.is_empty() {
+            (
+                gettext(locale, "No albums here yet"),
+                gettext(locale, "Add an album to this playlist from its menu."),
+            )
+        } else {
+            (
+                gettext(locale, "No matching albums"),
+                gettext(locale, "Try another filter."),
+            )
+        };
+        widgets::empty_state(ui, &palette, Icon::Disc, &title, &body);
+    }
+}
+
 fn song_count(locale: Locale, count: u32) -> String {
     ngettext(
         locale,
@@ -4961,6 +5174,7 @@ mod tests {
                             name: "Seed Radio",
                             save_radio: Some("spotify:track:seed".into()),
                             plays_shown_rows: false,
+                            album_view: None,
                         },
                         None,
                     )
@@ -5046,6 +5260,7 @@ mod tests {
                                     name: "Test",
                                     save_radio: None,
                                     plays_shown_rows: false,
+                                    album_view: None,
                                 },
                                 Some(&mut filter),
                             )
@@ -5171,6 +5386,7 @@ mod tests {
                         name: "Test",
                         save_radio: None,
                         plays_shown_rows: false,
+                        album_view: None,
                     },
                     None,
                 );
@@ -5235,6 +5451,7 @@ mod tests {
                             name: "Test",
                             save_radio: None,
                             plays_shown_rows: false,
+                            album_view: None,
                         },
                         None,
                     );
@@ -5294,6 +5511,7 @@ mod tests {
                     name: "Test",
                     save_radio: None,
                     plays_shown_rows: false,
+                    album_view: None,
                 },
                 None,
             );
@@ -5342,6 +5560,7 @@ mod tests {
                     name: "Test",
                     save_radio: None,
                     plays_shown_rows: false,
+                    album_view: None,
                 },
                 None,
             );
@@ -5394,6 +5613,7 @@ mod tests {
                     name: "Test",
                     save_radio: None,
                     plays_shown_rows: false,
+                    album_view: None,
                 },
                 None,
             );
@@ -5442,6 +5662,7 @@ mod tests {
                     name: "Test",
                     save_radio: None,
                     plays_shown_rows: false,
+                    album_view: None,
                 },
                 None,
             );
@@ -5495,6 +5716,7 @@ mod tests {
                     name: "Test",
                     save_radio: None,
                     plays_shown_rows: false,
+                    album_view: None,
                 },
                 Some(&mut filter),
             );
@@ -5543,6 +5765,7 @@ mod tests {
                     name: "Test",
                     save_radio: None,
                     plays_shown_rows: false,
+                    album_view: None,
                 },
                 Some(&mut filter),
             );

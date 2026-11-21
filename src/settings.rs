@@ -1899,6 +1899,9 @@ pub struct SessionState {
     pub repeat: String,
     /// Each table's chosen sort, by encoded page, restored at start.
     pub sorts: Vec<(String, crate::model::TableSort)>,
+    /// Playlists shown as albums rather than songs, by id.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub album_playlists: Vec<String>,
     /// Last window inner size, to restore on next launch. Logical pixels
     /// (points at zoom 1) since fastframe-shell's `Geometry`; earlier
     /// versions saved points at the interface zoom, the same at zoom 1.

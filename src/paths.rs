@@ -161,6 +161,12 @@ impl AppDirs {
         self.state.join("history.json")
     }
 
+    /// When each album was last played, for playlists shown as albums.
+    /// See [`crate::album_shelf`].
+    pub fn album_plays_file(&self) -> PathBuf {
+        self.state.join("album_plays.json")
+    }
+
     pub fn shared_web_token_file(&self) -> PathBuf {
         self.state.join("shared_web_api_token.json")
     }

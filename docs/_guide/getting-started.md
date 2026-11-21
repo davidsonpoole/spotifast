@@ -110,7 +110,8 @@ You can rename it in Settings.
   **New playlist**. Typing chooses the first match, so `Enter` adds to it;
   the up and down arrows choose another. You can add one song or a selection.
   If the playlist already contains the song, Spotifast asks before adding
-  another copy.
+  another copy. An album's menu has **Add to playlist** too, which adds all
+  of the album's songs; see [Playlists of albums](/using-spotifast/#albums).
 - **The heart likes, then adds to a playlist.** In the player bar, the heart
   saves the playing song to Liked Songs. Once it is liked, the heart opens a
   list of your playlists with their covers, Liked Songs checked at the top.

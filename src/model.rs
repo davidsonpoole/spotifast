@@ -1234,6 +1234,23 @@ pub enum Action {
         playlist_name: String,
         items: Vec<PlayableItem>,
     },
+    /// Add every song of an album to a playlist, fetching the album's
+    /// songs first when they are not already loaded.
+    AddAlbumToPlaylist {
+        album_uri: String,
+        album_name: String,
+        playlist_id: String,
+        playlist_name: String,
+    },
+    /// Show a playlist as albums, or as songs again.
+    ToggleAlbumView(String),
+    /// Play a playlist shown as albums with its albums shuffled: albums in
+    /// random order, each album's songs back to back. `first_album` names
+    /// an album id to start with.
+    PlayAlbumShuffle {
+        playlist_id: String,
+        first_album: Option<String>,
+    },
     /// Copy dragged songs into an open playlist at an absolute position.
     InsertInPlaylist {
         playlist_id: String,

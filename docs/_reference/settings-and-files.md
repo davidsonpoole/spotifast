@@ -24,6 +24,7 @@ Spotifast follows each platform's conventions. On Linux:
 | Legacy proxy password | `~/.local/state/spotifast/proxy_password` | Removed after protected migration |
 | Last session | `~/.local/state/spotifast/session.json` | Yes |
 | Play history | `~/.local/state/spotifast/history.json` | Yes |
+| When each album was last played | `~/.local/state/spotifast/album_plays.json` | Yes, albums sort as not played |
 | Audio cache | `~/.cache/spotifast/audio/` | Always |
 | Artwork cache | `~/.cache/spotifast/art/` | Always |
 | Lyrics cache | `~/.cache/spotifast/lyrics/` | Always |

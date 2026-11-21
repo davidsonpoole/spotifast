@@ -223,6 +223,13 @@ pub struct PlayRequest {
     pub offset_uri: Option<String>,
     pub offset_position: Option<u32>,
     pub position_ms: u32,
+    /// Play the songs in the order given, with Shuffle on or off: an album
+    /// shuffle orders them itself, albums at random and each album's songs
+    /// back to back. The player's own shuffle is turned off for it.
+    pub in_order: bool,
+    /// Load without starting: the song stays paused where it was, as when
+    /// Shuffle off puts a paused album shuffle back in playlist order.
+    pub paused: bool,
 }
 
 impl PlayRequest {
