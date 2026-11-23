@@ -472,13 +472,8 @@ pub(crate) fn run() -> eframe::Result<()> {
     if let Err(error) = dirs_ready {
         log::warn!("unable to create the application directories: {error}");
     }
-    // A Cargo run has no app bundle to supply its Dock icon. Use the same
-    // artwork as the packaged app; Fastframe preserves a bundle's own icon.
     #[cfg(target_os = "macos")]
-    if let Err(error) = fastframe_dock::set_icon(include_bytes!("../packaging/macos/icon-1024.png"))
-    {
-        log::warn!("unable to set the Dock icon: {error}");
-    }
+    app::set_dock_icon();
     let mut settings = settings::Settings::load(&dirs.settings_file());
     // An update an earlier run downloaded installs now, before anything
     // opens, when it installs on its own. The helper relaunches the new

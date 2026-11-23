@@ -1080,6 +1080,18 @@ pub fn shows_in_dock(setting: bool, menu_bar_item: bool) -> bool {
     setting || !menu_bar_item
 }
 
+/// A Cargo run has no app bundle to supply its Dock icon, so it is given
+/// the packaged app's artwork; Fastframe leaves a bundle's own icon alone.
+/// AppKit can put the generic icon back as it finishes launching and when
+/// the app comes back into the Dock, so this runs again after both.
+#[cfg(target_os = "macos")]
+pub fn set_dock_icon() {
+    if let Err(error) = fastframe_dock::set_icon(include_bytes!("../packaging/macos/icon-1024.png"))
+    {
+        log::warn!("unable to set the Dock icon: {error}");
+    }
+}
+
 /// The tray icon's rendition for the Tray icon setting (#128). The macOS
 /// menu bar keeps the template image, which it already draws black or white
 /// to match itself, so the setting is not offered there.
@@ -15338,6 +15350,11 @@ impl App {
         // changed in it.
         if fastframe_dock::set_dock_icon_visible(shown) && applied.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        // By the first pass AppKit has finished launching, which can reset
+        // an unbundled app's icon, and coming back into the Dock can too.
+        if shown {
+            set_dock_icon();
         }
     }
 
