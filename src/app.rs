@@ -9,8 +9,8 @@ use egui::Color32;
 
 use crate::api::PlayRequest;
 use crate::api::models::{
-    Album, Artist, ArtistRef, Device, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue,
-    Show, Track, TrackCount, User, UserRef, pick_image,
+    Album, Artist, ArtistRef, Device, Image, PlayableItem, PlaybackState, Playlist, PlaylistItem,
+    Queue, Show, Track, TrackCount, User, UserRef, pick_image,
 };
 use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, LyricsRequest,
@@ -97,6 +97,9 @@ const QUEUE_RECHECK: Duration = Duration::from_millis(700);
 /// Delay before reading a playlist's metadata again while Spotify still
 /// reports the snapshot from before a write.
 const PLAYLIST_SNAPSHOT_RECHECK: Duration = Duration::from_secs(1);
+/// How far into a playlist the albums of its mosaic are looked for: an album
+/// playlist holds whole albums, so its fourth may be far from its first.
+const COVER_ROWS: u32 = 200;
 /// Number of stale queue responses accepted before trusting Spotify's state.
 const QUEUE_STALE_RETRIES: u8 = 6;
 /// Duplicate queue requests within this window count as one click.
@@ -669,6 +672,11 @@ pub struct App {
     cover_uploads: HashMap<String, u64>,
     /// Successful uploads stay visible while Spotify propagates the new image.
     uploaded_covers: std::collections::HashMap<String, crate::playlist_cover::PendingCover>,
+    /// Playlists listed without a mosaic whose songs were read this
+    /// session for one.
+    covers_asked: HashSet<String>,
+    /// The album covers found so far by each cover read under way.
+    cover_reads: HashMap<String, Vec<Vec<Image>>>,
     pub show_queue_panel: bool,
     pub show_lyrics_panel: bool,
     /// Friend activity takes the right panel's place, so at most one of the
@@ -1411,6 +1419,8 @@ impl App {
             cover_request: 0,
             cover_uploads: HashMap::new(),
             uploaded_covers: Default::default(),
+            covers_asked: HashSet::new(),
+            cover_reads: HashMap::new(),
             show_queue_panel: session.queue_open.unwrap_or(false),
             show_lyrics_panel: false,
             show_friends_panel: false,
@@ -2080,6 +2090,19 @@ impl App {
             .as_ref()
             .and_then(|remote| remote.state.context.as_ref())
             .map(|context| crate::link::canonical_context_uri(&context.uri));
+        // An album shuffle plays the playlist's songs as a plain list,
+        // which Spotify reports as playing from the song's album. It is
+        // still the playlist playing while a song of its order plays.
+        if let Some((playlist, order)) = &self.album_shuffle_playing
+            && remote
+                .as_deref()
+                .is_none_or(|uri| util::uri_kind(uri) == Some("album"))
+            && self
+                .current_track_uri()
+                .is_some_and(|song| order.contains(&song))
+        {
+            return Some(playlist.clone());
+        }
         if let Some(assumed) = &self.assumed_context {
             let held = assumed.at.elapsed() < ASSUMED_CONTEXT_HOLD;
             // A filtered or sorted context plays as plain tracks and will not
@@ -6156,6 +6179,24 @@ impl App {
         let Some(playlists) = self.library.playlists.get() else {
             return;
         };
+        // A playlist listed without a cover, or with a single album's, is
+        // read for the albums of its mosaic, once a session.
+        let unmade: Vec<String> = playlists
+            .iter()
+            .filter(|listed| {
+                listed.images.is_empty() || crate::playlist_mosaic::is_single_album(&listed.images)
+            })
+            .filter(|listed| !self.uploaded_covers.contains_key(&listed.id))
+            .map(|listed| listed.id.clone())
+            .collect();
+        for id in unmade {
+            if self.covers_asked.insert(id.clone()) {
+                self.read_cover_albums(&id, 0);
+            }
+        }
+        let Some(playlists) = self.library.playlists.get() else {
+            return;
+        };
         for listed in playlists {
             self.saved.insert(listed.uri.clone(), true);
             // A header read over the streaming session lacks what the list
@@ -8067,6 +8108,106 @@ impl App {
         }
     }
 
+    /// Shows `cover`, made from a playlist's songs, for a playlist listed
+    /// without one. Spotify has made no mosaic yet for a new playlist, and a
+    /// list read over the playback session carries none at all. With
+    /// `fresh`, the cover was made from the playlist's own first albums and
+    /// also replaces one showing a single album, which may be older; a
+    /// mosaic, or a picture of the owner's own, stays.
+    fn borrow_playlist_cover(&mut self, id: &str, cover: Vec<Image>, fresh: bool) {
+        if self.uploaded_covers.contains_key(id) {
+            return;
+        }
+        let replaces = |shown: &[Image]| {
+            shown.is_empty()
+                || (fresh && shown != cover && crate::playlist_mosaic::is_single_album(shown))
+        };
+        if let Some(playlist) = self
+            .playlist_pages
+            .get_mut(id)
+            .and_then(|page| page.playlist.get_mut())
+            .filter(|playlist| replaces(&playlist.images))
+        {
+            playlist.images = cover.clone();
+        }
+        let mut listed = false;
+        if let Some(playlists) = self.library.playlists.get_mut() {
+            for playlist in playlists
+                .iter_mut()
+                .filter(|playlist| playlist.id == id && replaces(&playlist.images))
+            {
+                playlist.images = cover.clone();
+                listed = true;
+            }
+        }
+        if listed {
+            self.store_library_cache();
+        }
+    }
+
+    /// Makes a playlist's cover from its loaded rows, once they hold four
+    /// albums or the whole playlist.
+    fn borrow_playlist_cover_from_rows(&mut self, id: &str) {
+        let Some(page) = self.playlist_pages.get(id) else {
+            return;
+        };
+        if page.items.base_offset != 0 {
+            return;
+        }
+        let covers = crate::playlist_mosaic::album_covers(
+            page.items.items.iter().filter_map(|row| row.playable()),
+        );
+        let whole = page.items.loaded_once && page.items.next_offset.is_none();
+        if covers.len() < crate::playlist_mosaic::ALBUMS && !whole {
+            return;
+        }
+        if let Some(cover) = crate::playlist_mosaic::cover(&covers) {
+            self.borrow_playlist_cover(id, cover, true);
+        }
+    }
+
+    /// Reads a page of a playlist's songs for its cover's albums.
+    fn read_cover_albums(&mut self, id: &str, offset: u32) {
+        self.cover_reads.entry(id.to_string()).or_default();
+        self.backend.api(ApiRequest::PlaylistCover {
+            id: id.to_string(),
+            offset,
+        });
+    }
+
+    /// Takes a page read for a playlist's cover: four albums, the end of
+    /// the playlist, or as far as the cover is looked for, make it.
+    fn receive_cover_albums(
+        &mut self,
+        id: &str,
+        offset: u32,
+        rows: crate::api::models::Page<PlaylistItem>,
+    ) {
+        let Some(covers) = self.cover_reads.get_mut(id) else {
+            return;
+        };
+        for cover in
+            crate::playlist_mosaic::album_covers(rows.items.iter().filter_map(|row| row.playable()))
+        {
+            if !covers.contains(&cover) {
+                covers.push(cover);
+            }
+        }
+        let next = offset.saturating_add(rows.items.len() as u32);
+        if covers.len() < crate::playlist_mosaic::ALBUMS
+            && !rows.items.is_empty()
+            && next < rows.total
+            && next < COVER_ROWS
+        {
+            self.read_cover_albums(id, next);
+            return;
+        }
+        let covers = self.cover_reads.remove(id).unwrap_or_default();
+        if let Some(cover) = crate::playlist_mosaic::cover(&covers) {
+            self.borrow_playlist_cover(id, cover, true);
+        }
+    }
+
     fn reconcile_playlist_cover(&mut self, id: &str, images: &mut Vec<crate::api::models::Image>) {
         let Some(pending) = self.uploaded_covers.get_mut(id) else {
             return;
@@ -9034,12 +9175,19 @@ impl App {
                 self.request_user_names(adders);
                 self.sample_playlist_tail(&id);
                 self.checkpoint_playlist_cache(&id);
+                self.borrow_playlist_cover_from_rows(&id);
                 // A sorted table means the whole list, not the loaded part,
                 // and so does a shelf of albums.
                 if self.wants_whole_playlist(&id) {
                     self.load_more(Page::Playlist(id));
                 }
             }
+            ApiResponse::PlaylistCover { id, offset, result } => match result {
+                Ok(rows) => self.receive_cover_albums(&id, offset, rows),
+                Err(_) => {
+                    self.cover_reads.remove(&id);
+                }
+            },
             ApiResponse::PlaylistSample {
                 id,
                 generation,
@@ -11139,6 +11287,7 @@ impl App {
         self.request_contains(uris);
         self.request_user_names(adders);
         self.sample_playlist_tail(id);
+        self.borrow_playlist_cover_from_rows(id);
         if self.wants_whole_playlist(id) {
             self.load_more(Page::Playlist(id.to_string()));
         }
@@ -12649,6 +12798,15 @@ impl App {
         {
             increase_playlist_total(playlist, added);
         }
+        // The added songs' first album stands in until the playlist's own
+        // first albums are known.
+        if let Some(cover) = crate::playlist_mosaic::album_covers(&items)
+            .into_iter()
+            .next()
+        {
+            self.borrow_playlist_cover(&playlist_id, cover, false);
+        }
+        self.borrow_playlist_cover_from_rows(&playlist_id);
 
         self.backend.api(ApiRequest::AddToPlaylist {
             playlist_id,
@@ -30534,6 +30692,235 @@ mod tests {
         assert!(app.pending_album_queues.is_empty());
     }
 
+    /// A playlist listed without a cover, new or read over the playback
+    /// session, shows an album of its own in the sidebar until Spotify
+    /// lists a cover for it.
+    #[test]
+    fn a_playlist_without_a_cover_borrows_one_from_its_albums() {
+        let cover = |url: &str| {
+            vec![crate::api::models::Image {
+                url: url.into(),
+                width: Some(640),
+                height: Some(640),
+            }]
+        };
+        let song = |id: &str, art: &str| {
+            PlayableItem::Track(Track {
+                uri: format!("spotify:track:{id}"),
+                album: Some(Album {
+                    id: format!("album-{id}"),
+                    images: cover(art),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let listed = |id: &str, images| Playlist {
+            id: id.into(),
+            uri: format!("spotify:playlist:{id}"),
+            images,
+            ..Default::default()
+        };
+        let shown = |app: &App, id: &str| {
+            app.library_entry(id)
+                .unwrap()
+                .images
+                .iter()
+                .map(|image| image.url.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.library.playlists = Loadable::Loaded(vec![
+            listed("new", Vec::new()),
+            listed("own", cover("https://i.scdn.co/image/own")),
+            listed("opened", Vec::new()),
+        ]);
+
+        // Adding songs shows the first album's cover at once.
+        app.add_to_playlist_now(
+            "new".into(),
+            "New".into(),
+            vec![
+                PlayableItem::Episode(Default::default()),
+                song("a", "https://i.scdn.co/image/a"),
+                song("b", "https://i.scdn.co/image/b"),
+            ],
+            None,
+        );
+        assert_eq!(shown(&app, "new"), ["https://i.scdn.co/image/a"]);
+        app.add_to_playlist_now(
+            "new".into(),
+            "New".into(),
+            vec![song("c", "https://i.scdn.co/image/c")],
+            None,
+        );
+        assert_eq!(
+            shown(&app, "new"),
+            ["https://i.scdn.co/image/a"],
+            "it stays"
+        );
+        app.add_to_playlist_now(
+            "own".into(),
+            "Own".into(),
+            vec![song("d", "https://i.scdn.co/image/d")],
+            None,
+        );
+        assert_eq!(shown(&app, "own"), ["https://i.scdn.co/image/own"]);
+
+        // Opening one takes the cover of its first album.
+        app.playlist_pages.insert(
+            "opened".into(),
+            PlaylistPage {
+                generation: 1,
+                playlist: Loadable::Loaded(listed("opened", Vec::new())),
+                ..Default::default()
+            },
+        );
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "opened".into(),
+            offset: 0,
+            generation: 1,
+            result: Ok(crate::api::models::Page {
+                items: [song("e", "https://i.scdn.co/image/e")]
+                    .into_iter()
+                    .map(|item| PlaylistItem {
+                        item: Some(item),
+                        ..Default::default()
+                    })
+                    .collect(),
+                total: 1,
+                ..Default::default()
+            }),
+        });
+        assert_eq!(shown(&app, "opened"), ["https://i.scdn.co/image/e"]);
+        assert_eq!(
+            app.playlist_pages["opened"].playlist.get().unwrap().images,
+            cover("https://i.scdn.co/image/e"),
+            "and so does its page"
+        );
+
+        // Spotify's own cover replaces the borrowed one; a list with none
+        // keeps it. One never opened has its first songs read for a cover,
+        // once.
+        app.backend.take_playlist_cover_requests();
+        let generation = app.library.playlists_generation;
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            generation,
+            result: Ok(crate::api::models::Page {
+                items: vec![
+                    listed("new", cover("https://mosaic.scdn.co/640/new")),
+                    listed("own", cover("https://i.scdn.co/image/own")),
+                    listed("opened", Vec::new()),
+                    listed("unopened", Vec::new()),
+                ],
+                total: 4,
+                ..Default::default()
+            }),
+        });
+        assert_eq!(shown(&app, "new"), ["https://mosaic.scdn.co/640/new"]);
+        assert_eq!(shown(&app, "opened"), ["https://i.scdn.co/image/e"]);
+        assert!(shown(&app, "unopened").is_empty());
+        assert_eq!(app.backend.take_playlist_cover_requests(), ["unopened"]);
+        app.handle_api(ApiResponse::PlaylistCover {
+            id: "unopened".into(),
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: [song("f", "https://i.scdn.co/image/f")]
+                    .into_iter()
+                    .map(|item| PlaylistItem {
+                        item: Some(item),
+                        ..Default::default()
+                    })
+                    .collect(),
+                total: 1,
+                ..Default::default()
+            }),
+        });
+        assert_eq!(shown(&app, "unopened"), ["https://i.scdn.co/image/f"]);
+        app.note_listed_playlists();
+        assert!(app.backend.take_playlist_cover_requests().is_empty());
+    }
+
+    /// A playlist of four albums or more shows Spotify's mosaic of the
+    /// first four, though its fourth album is pages in. One listed with a
+    /// single album's cover takes the mosaic too; a mosaic stays.
+    #[test]
+    fn a_playlist_of_albums_shows_the_mosaic_of_its_first_four() {
+        let art = |n: u32| format!("https://i.scdn.co/image/ab67616d0000b273{n:024x}");
+        let song = |n: u32| PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                album: Some(Album {
+                    images: vec![Image {
+                        url: art(n),
+                        width: Some(640),
+                        height: Some(640),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let page = |rows: Vec<PlaylistItem>| crate::api::models::Page {
+            items: rows,
+            total: 120,
+            ..Default::default()
+        };
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        let single = vec![Image {
+            url: art(1),
+            width: None,
+            height: None,
+        }];
+        let mosaic = vec![Image {
+            url: "https://mosaic.scdn.co/640/made".into(),
+            width: None,
+            height: None,
+        }];
+        app.library.playlists = Loadable::Loaded(vec![
+            Playlist {
+                id: "albums".into(),
+                images: single.clone(),
+                ..Default::default()
+            },
+            Playlist {
+                id: "made".into(),
+                images: mosaic.clone(),
+                ..Default::default()
+            },
+        ]);
+        app.note_listed_playlists();
+        assert_eq!(app.backend.take_playlist_cover_requests(), ["albums"]);
+
+        // Two whole albums fill the first page; the next is read.
+        let first: Vec<_> = (0..50).map(|i| song(1 + i / 25)).collect();
+        app.handle_api(ApiResponse::PlaylistCover {
+            id: "albums".into(),
+            offset: 0,
+            result: Ok(page(first)),
+        });
+        assert_eq!(app.backend.take_playlist_cover_requests(), ["albums"]);
+        assert_eq!(app.library_entry("albums").unwrap().images, single);
+        let second: Vec<_> = (0..50).map(|i| song(3 + i / 20)).collect();
+        app.handle_api(ApiResponse::PlaylistCover {
+            id: "albums".into(),
+            offset: 50,
+            result: Ok(page(second)),
+        });
+        assert!(app.backend.take_playlist_cover_requests().is_empty());
+        let pieces: String = (1..=4)
+            .map(|n| format!("ab67616d00001e02{n:024x}"))
+            .collect();
+        assert_eq!(
+            app.library_entry("albums").unwrap().images[0].url,
+            format!("https://mosaic.scdn.co/640/{pieces}")
+        );
+        assert_eq!(app.library_entry("made").unwrap().images, mosaic);
+    }
+
     /// Whether `order` plays each of the playlist's albums whole, its songs
     /// back to back in playlist order.
     fn plays_whole_albums(app: &App, playlist: &str, order: &[String]) -> bool {
@@ -30616,6 +31003,85 @@ mod tests {
         reported.playback = Playback::Playing;
         app.handle_local(reported);
         assert!(app.playing_context_shuffle(), "Shuffle still shows on");
+    }
+
+    /// Spotify reports an album shuffle's songs as playing from their
+    /// albums. The playlist still shows as playing, in the sidebar and on
+    /// its page, until something else plays.
+    #[test]
+    fn an_album_shuffle_shows_its_playlist_playing_not_the_album() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        crate::demo::populate(&mut app);
+        app.remote = None;
+        app.selected_device = None;
+        app.local_ready = true;
+        app.local = LocalState {
+            connected: true,
+            ..Default::default()
+        };
+        app.album_playlists.insert("pl0".into());
+        app.shuffle_wanted = true;
+        app.apply(Action::ShufflePlay("spotify:playlist:pl0".into()), &ctx);
+        let order = app.album_shuffle_playing.clone().unwrap().1;
+        let song = order[1].clone();
+        let outside = app.playlist_pages["pl0"]
+            .items
+            .items
+            .iter()
+            .filter_map(|row| row.playable())
+            .map(|item| item.uri().to_string())
+            .find(|uri| !order.contains(uri));
+        // Long after the play, with the player and Spotify both on a later
+        // song of the order.
+        app.intent_track = None;
+        app.assumed_context = None;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: song.clone(),
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+        let report = |context: &str, song: &str| RemoteSnapshot {
+            state: PlaybackState {
+                context: Some(crate::api::models::Context {
+                    uri: context.into(),
+                    ..Default::default()
+                }),
+                item: Some(PlayableItem::Track(Track {
+                    uri: song.into(),
+                    ..Default::default()
+                })),
+                is_playing: true,
+                ..Default::default()
+            },
+            received_at: Instant::now(),
+        };
+        app.remote = Some(report("spotify:album:its-album", &song));
+        assert_eq!(
+            app.playing_context_uri().as_deref(),
+            Some("spotify:playlist:pl0")
+        );
+        app.remote = None;
+        assert_eq!(
+            app.playing_context_uri().as_deref(),
+            Some("spotify:playlist:pl0"),
+            "nor with no report at all"
+        );
+
+        // Another playlist, or a song the order lacks, is something else.
+        app.remote = Some(report("spotify:playlist:other", &song));
+        assert_eq!(
+            app.playing_context_uri().as_deref(),
+            Some("spotify:playlist:other")
+        );
+        if let Some(outside) = outside {
+            app.local.track.as_mut().unwrap().uri = outside.clone();
+            app.remote = Some(report("spotify:album:another", &outside));
+            assert_eq!(
+                app.playing_context_uri().as_deref(),
+                Some("spotify:album:another")
+            );
+        }
     }
 
     /// Shuffle off during an album shuffle puts the playlist's own order

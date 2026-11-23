@@ -227,6 +227,12 @@ pub enum ApiRequest {
         offset: u32,
         generation: u64,
     },
+    /// A page of a playlist's songs, read for the albums of its cover when
+    /// Spotify lists the playlist without a mosaic.
+    PlaylistCover {
+        id: String,
+        offset: u32,
+    },
     CreatePlaylist {
         name: String,
         public: bool,
@@ -410,6 +416,7 @@ impl ApiRequest {
                 | Self::HiddenSongs { .. }
                 | Self::MyPlaylists { .. }
                 | Self::PlaylistSample { .. }
+                | Self::PlaylistCover { .. }
                 | Self::Contains { .. }
         )
     }
@@ -491,6 +498,11 @@ pub enum ApiResponse {
     PlaylistSample {
         id: String,
         generation: u64,
+        result: ApiResult<Page<PlaylistItem>>,
+    },
+    PlaylistCover {
+        id: String,
+        offset: u32,
         result: ApiResult<Page<PlaylistItem>>,
     },
     PlaylistCreated(ApiResult<Playlist>),
@@ -1201,6 +1213,8 @@ pub struct Backend {
     #[cfg(test)]
     playlist_sample_requests: std::sync::Mutex<Vec<(String, u32, u64)>>,
     #[cfg(test)]
+    playlist_cover_requests: std::sync::Mutex<Vec<String>>,
+    #[cfg(test)]
     playlist_add_requests: std::sync::Mutex<Vec<ApiRequest>>,
     #[cfg(test)]
     remote_play_requests: std::sync::Mutex<Vec<ApiRequest>>,
@@ -1303,6 +1317,8 @@ impl Backend {
             playlist_item_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             playlist_sample_requests: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            playlist_cover_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             playlist_add_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1413,6 +1429,13 @@ impl Backend {
     }
 
     pub fn api(&self, request: ApiRequest) {
+        #[cfg(test)]
+        if let ApiRequest::PlaylistCover { id, .. } = &request {
+            self.playlist_cover_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(id.clone());
+        }
         #[cfg(test)]
         if matches!(
             request,
@@ -1585,6 +1608,16 @@ impl Backend {
         std::mem::take(
             &mut *self
                 .playlist_sample_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn take_playlist_cover_requests(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .playlist_cover_requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
@@ -5143,6 +5176,7 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         ApiRequest::Playlist { id, .. } => Operation::PlaylistMetadata(api.playlist_access(id)),
         ApiRequest::PlaylistItems { id, .. }
         | ApiRequest::PlaylistSample { id, .. }
+        | ApiRequest::PlaylistCover { id, .. }
         | ApiRequest::CheckPlaylistDuplicates {
             playlist_id: id, ..
         } => Operation::PlaylistItems(api.playlist_access(id)),
@@ -5216,6 +5250,11 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
             ..
         }
         | ApiResponse::PlaylistSample {
+            id,
+            result: Err(error),
+            ..
+        }
+        | ApiResponse::PlaylistCover {
             id,
             result: Err(error),
             ..
@@ -5727,6 +5766,11 @@ async fn handle(
             result: routed!(playlist_items(&id, offset, PLAYLIST_PAGE_SIZE)),
             id,
             generation,
+        },
+        ApiRequest::PlaylistCover { id, offset } => ApiResponse::PlaylistCover {
+            result: routed!(playlist_items(&id, offset, PLAYLIST_PAGE_SIZE)),
+            id,
+            offset,
         },
         ApiRequest::CreatePlaylist {
             name,
@@ -6275,6 +6319,9 @@ async fn over_session(
             SessionRead::Rows { id, offset } => SessionAnswer::Rows(settle(
                 session_reads::items(session, id, offset, PLAYLIST_PAGE_SIZE).await,
             )?),
+            SessionRead::Cover { id, offset } => SessionAnswer::Rows(settle(
+                session_reads::items(session, id, offset, PLAYLIST_PAGE_SIZE).await,
+            )?),
             SessionRead::Sample { id, offset } => SessionAnswer::Rows(settle(
                 session_reads::sample(session, id, offset, PLAYLIST_PAGE_SIZE).await,
             )?),
@@ -6319,6 +6366,10 @@ enum SessionRead<'a> {
         id: &'a str,
         offset: u32,
     },
+    Cover {
+        id: &'a str,
+        offset: u32,
+    },
     /// The whole playlist library, whichever page was asked for.
     Library,
 }
@@ -6333,6 +6384,10 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
             offset: *offset,
         },
         ApiRequest::PlaylistSample { id, offset, .. } => SessionRead::Sample {
+            id,
+            offset: *offset,
+        },
+        ApiRequest::PlaylistCover { id, offset } => SessionRead::Cover {
             id,
             offset: *offset,
         },
@@ -6388,6 +6443,13 @@ fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiRe
             generation: *generation,
             result,
         },
+        (ApiRequest::PlaylistCover { id, offset }, SessionAnswer::Rows(result)) => {
+            ApiResponse::PlaylistCover {
+                id: id.clone(),
+                offset: *offset,
+                result,
+            }
+        }
         (ApiRequest::PlaylistSample { id, generation, .. }, SessionAnswer::Rows(result)) => {
             ApiResponse::PlaylistSample {
                 id: id.clone(),

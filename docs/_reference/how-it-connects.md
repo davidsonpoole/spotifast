@@ -367,7 +367,15 @@ Spotify's own among them, in one request per 500 playlists. The rootlist names
 each owner by ID only, so their display names are read from their profiles
 over the same session, four at a time, for at most five seconds; a name that
 does not arrive in time shows as the ID. A playlist without a cover of its
-own keeps the mosaic the earlier list showed for it. A list still waiting on
+own keeps the mosaic the earlier list showed for it. One that never had a
+mosaic, such as a playlist made since, gets the cover Spotify would make:
+the first four albums' covers in quarters, or the first album's cover when
+it holds fewer. Spotify's image host draws a mosaic of any four album
+covers. Its songs are read for that once a session, 50 at a time up to its
+first 200, over the same session when it can answer; a playlist listed with
+a single album's cover is read the same way, and takes the mosaic once it
+holds four albums. Until then, songs added here show their album's cover. A
+mosaic, or a cover the owner set, is never replaced. A list still waiting on
 the shared app when local playback connects is read again this way. If the
 session cannot read the list, the request waits for the shared grant, or
 goes to the personal app when there is none. None of these reads use Web API quota.

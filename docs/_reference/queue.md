@@ -36,7 +36,10 @@ play its albums in random order, each album's songs back to back in the
 playlist's order. A cover's play button plays that album first, then the
 others at random. Shuffle stays on while the player plays this list
 straight; on another device, Spotifast turns that device's shuffle off for
-it. Each Play shuffles the albums afresh, and plays every album in the list
+it. Spotify receives the list as plain songs, so it reports each one as
+playing from its album, and the Spotify app on that device shows the album.
+Spotifast shows the playlist as playing, in the sidebar and on its page,
+while a song from the list plays. Each Play shuffles the albums afresh, and plays every album in the list
 once; Repeat plays the same order again. The list holds whole albums up to
 500 songs. Turning Shuffle off puts the playlist's own order back: the
 playlist plays on from the playing song at the same place, paused if it was
